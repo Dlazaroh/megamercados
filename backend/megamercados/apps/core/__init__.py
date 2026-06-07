@@ -1,0 +1,1 @@
+"""MegaMercados Core App"""

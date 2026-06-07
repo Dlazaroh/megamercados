@@ -1,0 +1,140 @@
+# ─── MegaMercados - Docker Compose ────────────────────────────────────────────
+# Orquestación de servicios: MySQL, Redis, Backend Django, Frontend React
+version: '3.9'
+
+services:
+
+  # ─── Base de Datos MySQL 8 ──────────────────────────────────────────────────
+  db:
+    image: mysql:8.0
+    container_name: megamercados_db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: megamercados_db
+      MYSQL_USER: megamercados_user
+      MYSQL_PASSWORD: ${DB_PASSWORD:-SecurePassword123!}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-RootPassword123!}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docs/schema.sql:/docker-entrypoint-initdb.d/00_schema.sql:ro
+    ports:
+      - "3306:3306"
+    networks:
+      - megamercados_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASSWORD:-RootPassword123!}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=mysql_native_password
+
+  # ─── Redis (Cache y Celery Broker) ──────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: megamercados_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - megamercados_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Backend Django ──────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: megamercados_backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      - DJANGO_SETTINGS_MODULE=megamercados.settings.production
+      - DB_HOST=db
+      - DB_PORT=3306
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - media_files:/app/media
+      - static_files:/app/staticfiles
+    ports:
+      - "8000:8000"
+    networks:
+      - megamercados_network
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "
+        echo '⏳ Esperando MySQL...' &&
+        python manage.py migrate --noinput &&
+        echo '✅ Migraciones aplicadas' &&
+        python manage.py collectstatic --noinput &&
+        gunicorn megamercados.wsgi:application
+          --bind 0.0.0.0:8000
+          --workers 4
+          --timeout 120
+          --keep-alive 5
+          --access-logfile -
+          --error-logfile -
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/swagger/?format=openapi || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ─── Frontend React + Nginx ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: http://localhost:8000/api/v1
+        REACT_APP_STRIPE_PUBLIC_KEY: ${STRIPE_PUBLISHABLE_KEY:-pk_test_placeholder}
+    container_name: megamercados_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    networks:
+      - megamercados_network
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+# ─── Volúmenes persistentes ────────────────────────────────────────────────────
+volumes:
+  mysql_data:
+    driver: local
+  redis_data:
+    driver: local
+  media_files:
+    driver: local
+  static_files:
+    driver: local
+
+# ─── Red interna ──────────────────────────────────────────────────────────────
+networks:
+  megamercados_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

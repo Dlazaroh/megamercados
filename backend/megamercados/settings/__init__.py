@@ -1,0 +1,1 @@
+"""MegaMercados Settings Package"""
